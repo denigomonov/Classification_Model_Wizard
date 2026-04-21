@@ -1,4 +1,4 @@
-# 🤖 sklearn Classification Wizard
+# ¯\_(ツ)_/¯ sklearn Classification Wizard
 
 Terminal-based engine that scans your CSV, asks a few questions, and benchmarks all major sklearn classifiers to recommend the top 3 for your specific problem — with reasoning and ready-to-use code.
 
@@ -72,3 +72,10 @@ To add a classifier: register it in `CANDIDATE_MODELS`, `FAST_DEFAULTS`, `_get_s
 - Tabular classification only (no regression, NLP, images)
 - Scores reflect your sample — validate on full data before committing
 - Optuna is stochastic — re-runs may surface slightly different params
+
+---
+## Waht to Expect 
+
+After you run `main.py` in your terminal you can expect to select your targets, answer questions and watch models go through Round 1 & 2.
+
+tba images
