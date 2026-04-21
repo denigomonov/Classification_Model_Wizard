@@ -229,13 +229,21 @@ def _round1_score(name, clf_class, params, X_sub, y_sub, cv):
 def run_round1(X: pd.DataFrame, y: np.ndarray, n_classes: int) -> list:
     console.rule("[bold yellow]⚡ Round 1: Elimination (subsample)[/bold yellow]")
 
-    # Stratified 30% subsample
     from sklearn.model_selection import train_test_split
-    _, X_sub, _, y_sub = train_test_split(X, y, test_size=0.3, stratify=y, random_state=42)
-    console.print(f"  Subsample size: {len(X_sub)} rows | Running {len(CANDIDATE_MODELS)} models in parallel...\n")
+
+    # Adaptive subsample cap: never exceed 10k rows in Round 1.
+    # On 114k rows, 30% = 34k which is still too slow for 16 parallel models.
+    n_total = len(X)
+    MAX_R1_ROWS = 10_000
+    if n_total > MAX_R1_ROWS:
+        sub_frac = MAX_R1_ROWS / n_total
+        _, X_sub, _, y_sub = train_test_split(X, y, test_size=sub_frac, stratify=y, random_state=42)
+    else:
+        _, X_sub, _, y_sub = train_test_split(X, y, test_size=0.3, stratify=y, random_state=42)
+
+    console.print(f"  Subsample size: {len(X_sub):,} / {n_total:,} rows | Running {len(CANDIDATE_MODELS)} models in parallel...\n")
 
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-    scoring = "f1_weighted" if n_classes > 2 else "f1"
 
     results = Parallel(n_jobs=-1)(
         delayed(_round1_score)(name, cls, FAST_DEFAULTS.get(name, {}), X_sub, y_sub, cv)
@@ -297,6 +305,22 @@ def _optuna_optimize(name, clf_class, X, y, n_trials=20):
 
 def run_round2(survivor_names: list, X: pd.DataFrame, y: np.ndarray, n_trials: int = 20) -> list:
     console.rule("[bold yellow]🏆 Round 2: Finals (full data + Optuna tuning)[/bold yellow]")
+
+    # Adaptive cap for Round 2: 5-fold CV on 114k rows per trial is prohibitive.
+    # Cap at 20k rows — enough for reliable ranking without melting RAM.
+    MAX_R2_ROWS = 20_000
+    n_total = len(X)
+    if n_total > MAX_R2_ROWS:
+        from sklearn.model_selection import train_test_split
+        frac = MAX_R2_ROWS / n_total
+        _, X_r2, _, y_r2 = train_test_split(X, y, test_size=frac, stratify=y, random_state=42)
+        console.print(
+            f"  [dim]Large dataset detected ({n_total:,} rows) — "
+            f"Round 2 uses a {len(X_r2):,}-row stratified sample for speed.[/dim]"
+        )
+    else:
+        X_r2, y_r2 = X, y
+
     console.print(f"  Tuning {len(survivor_names)} models with {n_trials} Optuna trials each...\n")
 
     with Progress(
@@ -311,7 +335,7 @@ def run_round2(survivor_names: list, X: pd.DataFrame, y: np.ndarray, n_trials: i
         for name in survivor_names:
             progress.update(task, description=f"Tuning [bold]{name}[/bold]")
             clf_class = CANDIDATE_MODELS[name]
-            n, score, params = _optuna_optimize(name, clf_class, X, y, n_trials=n_trials)
+            n, score, params = _optuna_optimize(name, clf_class, X_r2, y_r2, n_trials=n_trials)
             results.append((n, score, params))
             progress.advance(task)
 
@@ -329,6 +353,8 @@ def run_round2(survivor_names: list, X: pd.DataFrame, y: np.ndarray, n_trials: i
         t.add_row(medal, name, f"{score:.4f}")
 
     console.print(t)
+    if n_total > MAX_R2_ROWS:
+        console.print(f"[dim]  Note: scores based on {MAX_R2_ROWS:,}-row sample — validate final model on full data.[/dim]\n")
     return results
 
 
@@ -339,6 +365,15 @@ def run_benchmark(profile: dict, ctx: dict) -> list:
     df = profile["df"]
     target_col = ctx["target_col"]
 
+    # Drop columns that are pure text/ID — not useful as features
+    text_cols = [
+        c for c in df.columns
+        if c != target_col and df[c].dtype == object and df[c].nunique() > 50
+    ]
+    if text_cols:
+        console.print(f"[dim]Dropping high-cardinality text columns (not usable as features): {text_cols}[/dim]\n")
+        df = df.drop(columns=text_cols)
+
     X = df.drop(columns=[target_col])
     y_raw = df[target_col]
 
@@ -346,8 +381,8 @@ def run_benchmark(profile: dict, ctx: dict) -> list:
     y = le.fit_transform(y_raw)
     n_classes = len(le.classes_)
 
-    console.print(f"[dim]Target: '{target_col}' | Classes: {list(le.classes_)} | Features: {X.shape[1]}[/dim]\n")
+    console.print(f"[dim]Target: '{target_col}' | Classes: {n_classes} | Features: {X.shape[1]} | Rows: {len(X):,}[/dim]\n")
 
     survivors = run_round1(X, y, n_classes)
     final_results = run_round2(survivors, X, y)
-    return final_results[:3]  # Top 3 only
+    return final_results[:3]
