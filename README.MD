@@ -74,7 +74,7 @@ To add a classifier: register it in `CANDIDATE_MODELS`, `FAST_DEFAULTS`, `_get_s
 - Optuna is stochastic — re-runs may surface slightly different params
 
 ---
-## Waht to Expect 
+## What to Expect 
 
 After you run `main.py` in your terminal you can expect to select your targets, answer questions and watch models go through Round 1 & 2.
 
