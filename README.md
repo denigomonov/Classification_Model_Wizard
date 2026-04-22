@@ -98,7 +98,7 @@ recommender.py   Scoring, context-aware reasoning, rich terminal output + quick-
  
 | What | Where | Default |
 |---|---|---|
-| Max target cardinality | `scanner.py → MAX_TARGET_CARDINALITY` | `50` |
+| Max target cardinality | `scanner.py → MAX_TARGET_CARDINALITY` | `20` |
 | Round 1 row cap | `benchmark.py → run_round1()` | `10,000` |
 | Round 2 row cap | `benchmark.py → run_round2()` | `20,000` |
 | Optuna trials per model | `benchmark.py → run_round2()` | `20` |
