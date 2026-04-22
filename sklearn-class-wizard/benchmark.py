@@ -10,12 +10,13 @@ Speed strategy:
 This avoids wasting compute on poor candidates and focuses tuning effort on contenders.
 """
 
+import gc
 import time
 import warnings
 import numpy as np
 import pandas as pd
 import optuna
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, parallel_backend
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
@@ -245,10 +246,19 @@ def run_round1(X: pd.DataFrame, y: np.ndarray, n_classes: int) -> list:
 
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 
-    results = Parallel(n_jobs=-1)(
-        delayed(_round1_score)(name, cls, FAST_DEFAULTS.get(name, {}), X_sub, y_sub, cv)
-        for name, cls in CANDIDATE_MODELS.items()
-    )
+    results = []
+    with parallel_backend("loky", n_jobs=-1):
+        raw = Parallel()(
+            delayed(_round1_score)(name, cls, FAST_DEFAULTS.get(name, {}), X_sub, y_sub, cv)
+            for name, cls in CANDIDATE_MODELS.items()
+        )
+    results = raw
+
+    # Explicitly shut down loky worker pool and free subsample memory
+    from joblib.externals.loky import get_reusable_executor
+    get_reusable_executor().shutdown(wait=True)
+    del X_sub, y_sub
+    gc.collect()
 
     results = [(n, s, t) for n, s, t in results if s >= 0]
     results.sort(key=lambda x: -x[1])
@@ -381,8 +391,18 @@ def run_benchmark(profile: dict, ctx: dict) -> list:
     y = le.fit_transform(y_raw)
     n_classes = len(le.classes_)
 
+    # Free the raw dataframe — no longer needed once X and y are built
+    del df, y_raw
+    profile["df"] = None
+    gc.collect()
+
     console.print(f"[dim]Target: '{target_col}' | Classes: {n_classes} | Features: {X.shape[1]} | Rows: {len(X):,}[/dim]\n")
 
     survivors = run_round1(X, y, n_classes)
     final_results = run_round2(survivors, X, y)
+
+    # Final cleanup
+    del X, y
+    gc.collect()
+
     return final_results[:3]
