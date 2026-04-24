@@ -12,6 +12,7 @@ This avoids wasting compute on poor candidates and focuses tuning effort on cont
 
 import gc
 import time
+import platform
 import warnings
 import numpy as np
 import pandas as pd
@@ -38,6 +39,13 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from sklearn.neural_network import MLPClassifier
 
+try:
+    import lightgbm as lgb
+    HAS_LGBM = True
+except ImportError:
+    HAS_LGBM = False
+    _LGBM_GPU_OK = False
+
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.rule import Rule
@@ -47,46 +55,131 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 console = Console()
 
+
+# ── Device detection ──────────────────────────────────────────────────────────
+
+def _detect_device() -> str:
+    """Detect best available compute device. Returns 'mps', 'cuda', or 'cpu'."""
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                return "mps"
+        except ImportError:
+            # torch installed but mps check failed, still Apple Silicon
+            return "mps"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except ImportError:
+        pass
+    return "cpu"
+
+DEVICE = _detect_device()
+
+# Probe LightGBM GPU support now that DEVICE is known.
+# Must run after DEVICE assignment — pip wheels are CPU-only builds.
+_LGBM_GPU_OK = False
+if HAS_LGBM and DEVICE in ("mps", "cuda"):
+    import os, sys
+    try:
+        # Suppress LightGBM's Fatal stderr messages during the probe —
+        # it writes directly to stderr before raising, so redirect fd-level.
+        _devnull = open(os.devnull, "w")
+        _old_stderr_fd = os.dup(2)
+        os.dup2(_devnull.fileno(), 2)
+        try:
+            _probe = lgb.LGBMClassifier(n_estimators=1, device="gpu", gpu_use_dp=False, verbose=-1)
+            _probe.fit(np.array([[0.0], [1.0]]), np.array([0, 1]))
+            _LGBM_GPU_OK = True
+        finally:
+            os.dup2(_old_stderr_fd, 2)
+            os.close(_old_stderr_fd)
+            _devnull.close()
+    except Exception:
+        _LGBM_GPU_OK = False
+
+
+def print_device_banner():
+    """Print MPS/CUDA/CPU detection result before Round 1."""
+    if DEVICE == "mps":
+        if _LGBM_GPU_OK:
+            console.print("[bold green]⚡ Apple MPS detected — LightGBM running on Metal GPU[/bold green]")
+        else:
+            console.print("[bold yellow]⚡ Apple MPS detected — LightGBM falling back to CPU (pip wheel has no GPU support)[/bold yellow]")
+    elif DEVICE == "cuda":
+        if _LGBM_GPU_OK:
+            console.print("[bold green]⚡ CUDA detected — LightGBM running on GPU[/bold green]")
+        else:
+            console.print("[bold yellow]⚡ CUDA detected — LightGBM falling back to CPU (pip wheel has no GPU support)[/bold yellow]")
+    else:
+        console.print("[dim]🖥  No GPU acceleration detected — running on CPU[/dim]")
+
+
 # ── Candidate model registry ──────────────────────────────────────────────────
 
-CANDIDATE_MODELS = {
-    "RandomForest": RandomForestClassifier,
-    "ExtraTrees": ExtraTreesClassifier,
-    "GradientBoosting": GradientBoostingClassifier,
-    "HistGradientBoosting": HistGradientBoostingClassifier,
-    "AdaBoost": AdaBoostClassifier,
-    "LogisticRegression": LogisticRegression,
-    "RidgeClassifier": RidgeClassifier,
-    "SGD": SGDClassifier,
-    "DecisionTree": DecisionTreeClassifier,
-    "KNN": KNeighborsClassifier,
-    "SVC": SVC,
-    "LinearSVC": LinearSVC,
-    "GaussianNB": GaussianNB,
-    "LDA": LinearDiscriminantAnalysis,
-    "QDA": QuadraticDiscriminantAnalysis,
-    "MLP": MLPClassifier,
-}
+def _build_candidate_models() -> dict:
+    """Build CANDIDATE_MODELS dict, injecting LightGBM with correct device if available."""
+    models = {
+        "RandomForest": RandomForestClassifier,
+        "ExtraTrees": ExtraTreesClassifier,
+        "GradientBoosting": GradientBoostingClassifier,
+        "HistGradientBoosting": HistGradientBoostingClassifier,
+        "AdaBoost": AdaBoostClassifier,
+        "LogisticRegression": LogisticRegression,
+        "RidgeClassifier": RidgeClassifier,
+        "SGD": SGDClassifier,
+        "DecisionTree": DecisionTreeClassifier,
+        "KNN": KNeighborsClassifier,
+        "SVC": SVC,
+        "LinearSVC": LinearSVC,
+        "GaussianNB": GaussianNB,
+        "LDA": LinearDiscriminantAnalysis,
+        "QDA": QuadraticDiscriminantAnalysis,
+        "MLP": MLPClassifier,
+    }
+    if HAS_LGBM:
+        models["LightGBM"] = lgb.LGBMClassifier
+    return models
+
+CANDIDATE_MODELS = _build_candidate_models()
 
 # Fast default params for Round 1 (speed > accuracy)
-FAST_DEFAULTS = {
-    "RandomForest": {"n_estimators": 50, "max_depth": 8, "n_jobs": -1, "random_state": 42},
-    "ExtraTrees": {"n_estimators": 50, "max_depth": 8, "n_jobs": -1, "random_state": 42},
-    "GradientBoosting": {"n_estimators": 50, "max_depth": 4, "random_state": 42},
-    "HistGradientBoosting": {"max_iter": 50, "random_state": 42},
-    "AdaBoost": {"n_estimators": 50, "random_state": 42},
-    "LogisticRegression": {"max_iter": 300, "random_state": 42},
-    "RidgeClassifier": {},
-    "SGD": {"max_iter": 100, "random_state": 42},
-    "DecisionTree": {"max_depth": 8, "random_state": 42},
-    "KNN": {"n_neighbors": 7},
-    "SVC": {"kernel": "rbf", "C": 1.0, "probability": False, "random_state": 42},
-    "LinearSVC": {"max_iter": 500, "random_state": 42},
-    "GaussianNB": {},
-    "LDA": {},
-    "QDA": {"reg_param": 0.1},
-    "MLP": {"hidden_layer_sizes": (64,), "max_iter": 100, "random_state": 42},
-}
+def _build_fast_defaults() -> dict:
+    defaults = {
+        "RandomForest": {"n_estimators": 50, "max_depth": 8, "n_jobs": -1, "random_state": 42},
+        "ExtraTrees": {"n_estimators": 50, "max_depth": 8, "n_jobs": -1, "random_state": 42},
+        "GradientBoosting": {"n_estimators": 50, "max_depth": 4, "random_state": 42},
+        "HistGradientBoosting": {"max_iter": 50, "random_state": 42},
+        "AdaBoost": {"n_estimators": 50, "random_state": 42},
+        "LogisticRegression": {"max_iter": 300, "random_state": 42},
+        "RidgeClassifier": {},
+        "SGD": {"max_iter": 100, "random_state": 42},
+        "DecisionTree": {"max_depth": 8, "random_state": 42},
+        "KNN": {"n_neighbors": 7},
+        "SVC": {"kernel": "rbf", "C": 1.0, "probability": False, "random_state": 42},
+        "LinearSVC": {"max_iter": 500, "random_state": 42},
+        "GaussianNB": {},
+        "LDA": {},
+        "QDA": {"reg_param": 0.1},
+        "MLP": {"hidden_layer_sizes": (64,), "max_iter": 100, "random_state": 42},
+    }
+    if HAS_LGBM:
+        lgbm_defaults = {
+            "n_estimators": 100,
+            "num_leaves": 31,
+            "verbose": -1,
+            "n_jobs": -1,
+            "random_state": 42,
+        }
+        if _LGBM_GPU_OK:
+            lgbm_defaults["device"] = "gpu"
+            lgbm_defaults["gpu_use_dp"] = False
+        defaults["LightGBM"] = lgbm_defaults
+    return defaults
+
+FAST_DEFAULTS = _build_fast_defaults()
 
 # Optuna search spaces for Round 2.
 # Uses if/elif so only the target model's trial.suggest_* calls execute —
@@ -185,6 +278,23 @@ def _get_search_space(trial, name):
             "alpha":    trial.suggest_float("alpha", 1e-5, 0.01, log=True),
             "max_iter": 300, "random_state": 42,
         }
+    elif name == "LightGBM":
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
+            "num_leaves":       trial.suggest_int("num_leaves", 20, 150),
+            "max_depth":        trial.suggest_int("max_depth", 3, 10),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            "verbose": -1,
+            "n_jobs": -1,
+            "random_state": 42,
+        }
+        if _LGBM_GPU_OK:
+            params["device"] = "gpu"
+            params["gpu_use_dp"] = False
+        return params
     return {}
 
 
@@ -309,7 +419,7 @@ def _optuna_optimize(name, clf_class, X, y, n_trials=20):
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(),
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, n_jobs=5, show_progress_bar=False)
     return name, study.best_value, study.best_params
 
 
@@ -398,6 +508,7 @@ def run_benchmark(profile: dict, ctx: dict) -> list:
 
     console.print(f"[dim]Target: '{target_col}' | Classes: {n_classes} | Features: {X.shape[1]} | Rows: {len(X):,}[/dim]\n")
 
+    print_device_banner()
     survivors = run_round1(X, y, n_classes)
     final_results = run_round2(survivors, X, y)
 
