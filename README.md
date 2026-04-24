@@ -67,6 +67,13 @@ High-cardinality text columns (e.g. artist names, track titles) are excluded fro
 Both caps use stratified sampling to preserve class distribution. Scores on large datasets reflect the sample — validate your final model on the full data before committing.
  
 ---
+
+## GPU & LightGBM
+
+- `⚡ Apple MPS detected — LightGBM running on Metal GPU` — source build with `-DUSE_GPU=1`
+- `⚡ Apple MPS detected — LightGBM falling back to CPU (pip wheel has no GPU support)` — standard pip install
+LightGBM on CPU is still faster than sklearn's `GradientBoosting` due to histogram-based splitting and full `n_jobs=-1` parallelism across all cores.
+
  
 ## Memory Management
  
@@ -94,14 +101,16 @@ recommender.py   Scoring, context-aware reasoning, rich terminal output + quick-
  
 ---
  
-## Tuning Knobs
+## Flow
+ 
  
 | What | Where | Default |
 |---|---|---|
-| Max target cardinality | `scanner.py → MAX_TARGET_CARDINALITY` | `20` |
+| Max target cardinality | `scanner.py → MAX_TARGET_CARDINALITY` | `50` |
 | Round 1 row cap | `benchmark.py → run_round1()` | `10,000` |
 | Round 2 row cap | `benchmark.py → run_round2()` | `20,000` |
 | Optuna trials per model | `benchmark.py → run_round2()` | `20` |
+| Optuna parallel trials | `benchmark.py → _optuna_optimize()` | `n_jobs=5` |
 | Survivor count into Round 2 | `benchmark.py → run_round1()` | `max(4, n // 2)` |
  
 To add a classifier: register it in `CANDIDATE_MODELS`, `FAST_DEFAULTS`, and `_get_search_space()` in `benchmark.py`, and `MODEL_TRAITS` in `recommender.py`.
